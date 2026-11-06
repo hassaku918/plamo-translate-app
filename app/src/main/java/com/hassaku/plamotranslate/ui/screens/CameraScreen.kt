@@ -45,6 +45,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -78,8 +79,16 @@ fun CameraScreen(
 
     val captureFlag = remember { AtomicBoolean(false) }
     val analyzerExecutor = remember { Executors.newSingleThreadExecutor() }
+    val cameraProviderRef = remember { AtomicReference<ProcessCameraProvider?>(null) }
+
+    // Always release camera when leaving this screen (pager swipe / nav)
     DisposableEffect(Unit) {
-        onDispose { analyzerExecutor.shutdown() }
+        onDispose {
+            captureFlag.set(false)
+            runCatching { cameraProviderRef.get()?.unbindAll() }
+            cameraProviderRef.set(null)
+            analyzerExecutor.shutdown()
+        }
     }
 
     if (!hasPermission) {
@@ -97,6 +106,12 @@ fun CameraScreen(
 
     Box(modifier = modifier.fillMaxSize()) {
         key(lensFacing, bindKey) {
+            // Rebind/unbind for this preview instance
+            DisposableEffect(lensFacing, bindKey) {
+                onDispose {
+                    runCatching { cameraProviderRef.get()?.unbindAll() }
+                }
+            }
             AndroidView(
                 factory = { ctx ->
                     val previewView = PreviewView(ctx).apply {
@@ -105,11 +120,13 @@ fun CameraScreen(
                             ViewGroup.LayoutParams.MATCH_PARENT
                         )
                         scaleType = PreviewView.ScaleType.FILL_CENTER
+                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                     }
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                     cameraProviderFuture.addListener({
                         try {
                             val cameraProvider = cameraProviderFuture.get()
+                            cameraProviderRef.set(cameraProvider)
                             val preview = Preview.Builder().build().also {
                                 it.surfaceProvider = previewView.surfaceProvider
                             }
@@ -178,7 +195,8 @@ fun CameraScreen(
         ) {
             Text("テキストを撮影して選択", color = Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             IconButton(onClick = {
-                lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+                    CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
                 bindKey++
             }) {
                 Icon(Icons.Default.Cameraswitch, contentDescription = "切替", tint = Color.White)
@@ -186,7 +204,11 @@ fun CameraScreen(
         }
 
         ocrError?.let { msg ->
-            Text(msg, color = Color.White, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 100.dp))
+            Text(
+                msg,
+                color = Color.White,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 100.dp)
+            )
         }
 
         FloatingActionButton(
@@ -195,7 +217,11 @@ fun CameraScreen(
             containerColor = MaterialTheme.colorScheme.primary
         ) {
             if (isProcessing) {
-                CircularProgressIndicator(modifier = Modifier.size(28.dp), color = Color.White, strokeWidth = 2.dp)
+                CircularProgressIndicator(
+                    modifier = Modifier.size(28.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp
+                )
             } else {
                 Icon(Icons.Default.PhotoCamera, contentDescription = "撮影")
             }
@@ -227,14 +253,23 @@ fun CameraScreen(
                         items(recognizedBlocks) { block ->
                             val isSelected = selectedBlock == block
                             Card(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                                    .then(if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary) else Modifier)
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                                    .then(
+                                        if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary)
+                                        else Modifier
+                                    )
                                     .clickable { selectedBlock = block }
                             ) {
                                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Text(block.text, modifier = Modifier.weight(1f))
                                     if (isSelected) {
-                                        Icon(Icons.Default.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                        Icon(
+                                            Icons.Default.Check,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
                                     }
                                 }
                             }

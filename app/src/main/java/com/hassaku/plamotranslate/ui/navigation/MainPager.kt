@@ -73,7 +73,8 @@ fun MainPager(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
-            beyondViewportPageCount = 1
+            // Keep off-screen pages out of composition so CameraX fully releases
+            beyondViewportPageCount = 0
         ) { page ->
             when (AppPage.entries[page]) {
                 AppPage.TRANSLATE -> {
