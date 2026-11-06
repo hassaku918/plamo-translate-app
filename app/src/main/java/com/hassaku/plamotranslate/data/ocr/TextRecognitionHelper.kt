@@ -5,8 +5,9 @@ import android.graphics.Rect
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.TextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.suspendCancellableCoroutine
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -28,11 +29,11 @@ data class RecognitionResult(
 @Singleton
 class TextRecognitionHelper @Inject constructor() {
 
-    private val japaneseRecognizer = TextRecognition.getClient(
+    private val japaneseRecognizer: TextRecognizer = TextRecognition.getClient(
         JapaneseTextRecognizerOptions.Builder().build()
     )
 
-    private val latinRecognizer = TextRecognition.getClient(
+    private val latinRecognizer: TextRecognizer = TextRecognition.getClient(
         TextRecognizerOptions.DEFAULT_OPTIONS
     )
 
@@ -46,7 +47,7 @@ class TextRecognitionHelper @Inject constructor() {
     }
 
     private suspend fun process(
-        client: com.google.mlkit.vision.text.TextRecognizer,
+        client: TextRecognizer,
         image: InputImage
     ): RecognitionResult = suspendCancellableCoroutine { cont ->
         client.process(image)
@@ -63,7 +64,7 @@ class TextRecognitionHelper @Inject constructor() {
             RecognizedBlock(
                 text = block.text,
                 boundingBox = block.boundingBox,
-                confidence = block.confidence,
+                confidence = null,
                 lines = block.lines.map { it.text }
             )
         }
