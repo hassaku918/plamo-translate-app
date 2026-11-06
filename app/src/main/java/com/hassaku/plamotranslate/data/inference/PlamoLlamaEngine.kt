@@ -7,7 +7,6 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
@@ -29,9 +28,10 @@ class PlamoLlamaEngine @Inject constructor(
 
     companion object {
         private const val TAG = "PlamoLlamaEngine"
-        private const val DEFAULT_CTX = 4096
+        // 4096 is heavy on mid-range phones; 2048 is enough for short translation
+        private const val DEFAULT_CTX = 2048
         private const val GEN_TIMEOUT_MS = 120_000L
-        private const val LOAD_TIMEOUT_MS = 180_000L
+        private const val LOAD_TIMEOUT_MS = 240_000L
         const val MAX_INPUT_CHARS = 4000
         private const val MIN_MODEL_BYTES = 300_000_000L
     }
@@ -51,41 +51,57 @@ class PlamoLlamaEngine @Inject constructor(
         get() = modelLoaded && helper != null
 
     override val engineName: String
-        get() = if (isReady) "PLaMo-3-0.8B (GGUF/Q4_K_M)" else "PLaMo (not loaded)"
+        get() = if (isReady) "PLaMo-3-0.8B (GGUF)" else "PLaMo (not loaded)"
 
     override suspend fun loadModel(modelPath: String): Result<Unit> = withContext(Dispatchers.IO) {
         if (isReady && currentModelPath == modelPath) {
             return@withContext Result.success(Unit)
         }
         if (!loading.compareAndSet(false, true)) {
-            return@withContext Result.failure(IllegalStateException("Load already in progress"))
+            return@withContext Result.failure(IllegalStateException("ロード処理中です"))
         }
         try {
             mutex.withLock {
                 val file = File(modelPath)
-                if (!file.exists() || file.length() < MIN_MODEL_BYTES) {
-                    return@withContext Result.failure(IllegalArgumentException("Model file missing or too small"))
+                if (!file.exists()) {
+                    return@withContext Result.failure(
+                        IllegalArgumentException("モデルファイルがありません: $modelPath")
+                    )
                 }
-                Log.i(TAG, "Loading ${file.length() / 1_000_000} MB from $modelPath")
+                if (file.length() < MIN_MODEL_BYTES) {
+                    return@withContext Result.failure(
+                        IllegalArgumentException(
+                            "モデルが小さすぎます (${file.length() / 1_000_000}MB)。再ダウンロードしてください"
+                        )
+                    )
+                }
+
+                Log.i(TAG, "Loading ${file.length() / 1_000_000} MB from ${file.absolutePath}")
                 requestId.incrementAndGet()
-                helper?.release()
+                runCatching { helper?.release() }
                 helper = null
                 modelLoaded = false
-                drainEvents()
+
                 val h = LlamaHelper(
                     contentResolver = context.contentResolver,
                     scope = scope,
                     sharedFlow = eventFlow
                 )
                 val loaded = CompletableDeferred<Unit>()
-                val uri = Uri.fromFile(file).toString()
                 val myLoadGen = requestId.get()
+
+                // Prefer file:// URI for app-private storage (kotlinllamacpp docs)
+                val uri = Uri.fromFile(file).toString()
+
                 val collectJob = scope.launch {
                     eventFlow.collect { ev ->
                         if (requestId.get() != myLoadGen) return@collect
                         when (ev) {
                             is LlamaHelper.LLMEvent.Error -> {
-                                if (!loaded.isCompleted) loaded.completeExceptionally(RuntimeException(ev.message))
+                                Log.e(TAG, "Load event error: ${ev.message}")
+                                if (!loaded.isCompleted) {
+                                    loaded.completeExceptionally(RuntimeException(ev.message))
+                                }
                             }
                             is LlamaHelper.LLMEvent.Loaded -> {
                                 if (!loaded.isCompleted) loaded.complete(Unit)
@@ -94,14 +110,18 @@ class PlamoLlamaEngine @Inject constructor(
                         }
                     }
                 }
+
                 try {
                     h.load(path = uri, contextLength = DEFAULT_CTX) { _ ->
-                        if (!loaded.isCompleted && requestId.get() == myLoadGen) loaded.complete(Unit)
+                        if (!loaded.isCompleted && requestId.get() == myLoadGen) {
+                            loaded.complete(Unit)
+                        }
                     }
                     withTimeout(LOAD_TIMEOUT_MS) { loaded.await() }
                 } finally {
                     collectJob.cancel()
                 }
+
                 helper = h
                 modelLoaded = true
                 currentModelPath = modelPath
@@ -110,10 +130,18 @@ class PlamoLlamaEngine @Inject constructor(
             }
         } catch (e: Exception) {
             Log.e(TAG, "loadModel failed", e)
-            helper?.release()
+            runCatching { helper?.release() }
             helper = null
             modelLoaded = false
-            Result.failure(e)
+            val msg = when {
+                e.message?.contains("OutOfMemory", ignoreCase = true) == true ||
+                    e is OutOfMemoryError ->
+                    "メモリ不足でロードできません。他のアプリを閉じて再試行してください"
+                e.message?.contains("timeout", ignoreCase = true) == true ->
+                    "ロードがタイムアウトしました。端末性能不足の可能性があります"
+                else -> e.message ?: "モデルの読み込みに失敗しました"
+            }
+            Result.failure(RuntimeException(msg, e))
         } finally {
             loading.set(false)
         }
@@ -135,20 +163,19 @@ class PlamoLlamaEngine @Inject constructor(
         targetLang: String,
         style: Style
     ): Result<String> = withContext(Dispatchers.IO) {
-        if (!isReady) return@withContext Result.failure(IllegalStateException("Model not loaded"))
+        if (!isReady) return@withContext Result.failure(IllegalStateException("モデルがロードされていません"))
         if (!translating.compareAndSet(false, true)) {
-            return@withContext Result.failure(IllegalStateException("Translation already in progress"))
+            return@withContext Result.failure(IllegalStateException("翻訳処理中です"))
         }
         val clipped = if (text.length > MAX_INPUT_CHARS) text.take(MAX_INPUT_CHARS) else text
         val h = helper
         if (h == null) {
             translating.set(false)
-            return@withContext Result.failure(IllegalStateException("Helper null"))
+            return@withContext Result.failure(IllegalStateException("エンジンが初期化されていません"))
         }
         val myId = requestId.incrementAndGet()
         try {
             mutex.withLock {
-                drainEvents()
                 try {
                     val prompt = buildPrompt(clipped, sourceLang, targetLang, style)
                     val done = CompletableDeferred<String>()
@@ -160,7 +187,9 @@ class PlamoLlamaEngine @Inject constructor(
                                     if (!done.isCompleted) done.complete(ev.fullText)
                                 }
                                 is LlamaHelper.LLMEvent.Error -> {
-                                    if (!done.isCompleted) done.completeExceptionally(RuntimeException(ev.message))
+                                    if (!done.isCompleted) {
+                                        done.completeExceptionally(RuntimeException(ev.message))
+                                    }
                                 }
                                 else -> Unit
                             }
@@ -182,8 +211,6 @@ class PlamoLlamaEngine @Inject constructor(
             translating.set(false)
         }
     }
-
-    private fun drainEvents() {}
 
     private fun buildPrompt(text: String, sourceLang: String, targetLang: String, style: Style): String {
         val src = normalizeLang(sourceLang)

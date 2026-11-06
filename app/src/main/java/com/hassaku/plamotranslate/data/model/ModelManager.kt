@@ -25,28 +25,33 @@ class ModelManager @Inject constructor(
     companion object {
         private const val TAG = "ModelManager"
         const val HF_REPO = "pfnet/plamo-3-translate-0.8b-GGUF"
+        // Prefer smaller Q4_0 first for phones, then Q4_K_M
         val CANDIDATE_FILES = listOf(
-            "plamo-3-translate-0.8b-Q4_K_M.gguf",
-            "plamo-3-translate-0.8b-Q4_0.gguf",
+            "plamo-3-translate-0.8b-Q4_0.gguf",      // ~522 MB
+            "plamo-3-translate-0.8b-Q4_K_M.gguf",   // ~547 MB
             "plamo-3-translate-0.8b-Q3_K_M.gguf",
             "plamo-3-translate-0.8b-Q2_K.gguf"
         )
         private const val MIN_VALID_BYTES = 300_000_000L
-        private const val MIN_FREE_BYTES = 700_000_000L
+        private const val MIN_FREE_BYTES = 800_000_000L
         fun resolveUrl(filename: String) =
-            "https://huggingface.co/$HF_REPO/resolve/main/$filename"
+            "https://huggingface.co/$HF_REPO/resolve/main/$filename?download=true"
     }
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(300, TimeUnit.SECONDS)
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(600, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
     private val modelsDir: File
         get() = File(context.filesDir, "models").also { it.mkdirs() }
 
+    /** Canonical on-disk name (any quant is renamed to this). */
     val modelFile: File
-        get() = File(modelsDir, "plamo-3-translate-0.8b-Q4_K_M.gguf")
+        get() = File(modelsDir, "plamo-3-translate.gguf")
 
     private val _downloadProgress = MutableStateFlow(0f)
     val downloadProgress: StateFlow<Float> = _downloadProgress.asStateFlow()
@@ -60,7 +65,7 @@ class ModelManager @Inject constructor(
 
     fun refreshStatus() {
         _status.value = when {
-            modelFile.exists() && modelFile.length() >= MIN_VALID_BYTES ->
+            modelFile.exists() && modelFile.length() >= MIN_VALID_BYTES && hasGgufMagic(modelFile) ->
                 ModelStatus.Ready(modelFile.absolutePath)
             modelFile.exists() -> ModelStatus.Corrupted
             else -> ModelStatus.NotDownloaded
@@ -68,7 +73,9 @@ class ModelManager @Inject constructor(
     }
 
     fun isModelReady(): Boolean =
-        modelFile.exists() && modelFile.length() >= MIN_VALID_BYTES
+        modelFile.exists() &&
+            modelFile.length() >= MIN_VALID_BYTES &&
+            hasGgufMagic(modelFile)
 
     suspend fun downloadModel(): Result<File> = withContext(Dispatchers.IO) {
         if (isModelReady()) {
@@ -76,35 +83,55 @@ class ModelManager @Inject constructor(
             return@withContext Result.success(modelFile)
         }
         if (!downloading.compareAndSet(false, true)) {
-            return@withContext Result.failure(IllegalStateException("Download already in progress"))
+            return@withContext Result.failure(IllegalStateException("ダウンロードは既に進行中です"))
         }
         try {
+            // Remove partial / corrupt files first
+            if (modelFile.exists() && !isModelReady()) {
+                modelFile.delete()
+            }
+
             val free = freeSpaceBytes(modelsDir)
             if (free in 1 until MIN_FREE_BYTES) {
-                val msg = "ストレージ不足: 空き ${(free / 1_000_000)}MB（目安 700MB以上）"
+                val msg = "ストレージ不足: 空き ${(free / 1_000_000)}MB（目安 800MB以上）"
                 _status.value = ModelStatus.Error(msg)
                 return@withContext Result.failure(IllegalStateException(msg))
             }
+
             _status.value = ModelStatus.Downloading
             _downloadProgress.value = 0f
             var lastError: Exception? = null
+
             for (filename in CANDIDATE_FILES) {
                 val url = resolveUrl(filename)
                 Log.i(TAG, "Trying $url")
                 try {
-                    val request = Request.Builder().url(url).build()
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "PLaMoTranslateAndroid/1.0")
+                        .header("Accept", "application/octet-stream,*/*")
+                        .get()
+                        .build()
+
                     client.newCall(request).execute().use { response ->
                         if (!response.isSuccessful) {
-                            Log.w(TAG, "HTTP ${response.code} for $filename")
+                            val err = "HTTP ${response.code} for $filename"
+                            Log.w(TAG, err)
+                            lastError = IllegalStateException(err)
                             return@use
                         }
-                        val body = response.body ?: return@use
+                        val body = response.body
+                        if (body == null) {
+                            lastError = IllegalStateException("空のレスポンス: $filename")
+                            return@use
+                        }
                         val expected = body.contentLength()
                         val tmp = File(modelsDir, "$filename.tmp")
                         if (tmp.exists()) tmp.delete()
+
                         FileOutputStream(tmp).use { out ->
                             body.byteStream().use { input ->
-                                val buffer = ByteArray(64 * 1024)
+                                val buffer = ByteArray(256 * 1024)
                                 var downloaded = 0L
                                 var read: Int
                                 while (input.read(buffer).also { read = it } != -1) {
@@ -113,29 +140,43 @@ class ModelManager @Inject constructor(
                                     if (expected > 0) {
                                         _downloadProgress.value =
                                             (downloaded.toFloat() / expected).coerceIn(0f, 1f)
+                                    } else if (downloaded > 0) {
+                                        // Unknown length: approximate against ~550MB
+                                        _downloadProgress.value =
+                                            (downloaded.toFloat() / 550_000_000f).coerceIn(0f, 0.99f)
                                     }
                                 }
+                                out.fd.sync()
                             }
                         }
+
                         val actual = tmp.length()
                         if (actual < MIN_VALID_BYTES) {
                             tmp.delete()
-                            throw IllegalStateException("Downloaded file too small ($actual bytes)")
+                            throw IllegalStateException(
+                                "ファイルが小さすぎます (${actual / 1_000_000}MB)。ネットワーク切断の可能性"
+                            )
                         }
-                        if (expected > 0 && actual != expected) {
+                        if (expected > 0 && kotlin.math.abs(actual - expected) > 1024) {
                             tmp.delete()
-                            throw IllegalStateException("Size mismatch: expected=$expected actual=$actual")
+                            throw IllegalStateException(
+                                "サイズ不一致: expected=$expected actual=$actual"
+                            )
                         }
                         if (!hasGgufMagic(tmp)) {
                             tmp.delete()
-                            throw IllegalStateException("Not a GGUF file: $filename")
+                            throw IllegalStateException(
+                                "GGUF形式ではありません（HTMLが返った可能性）: $filename"
+                            )
                         }
+
                         if (modelFile.exists()) modelFile.delete()
                         if (!tmp.renameTo(modelFile)) {
                             tmp.copyTo(modelFile, overwrite = true)
                             tmp.delete()
                         }
-                        Log.i(TAG, "Downloaded ${modelFile.length() / 1_000_000} MB")
+
+                        Log.i(TAG, "Downloaded ${modelFile.length() / 1_000_000} MB as ${modelFile.name}")
                         _status.value = ModelStatus.Ready(modelFile.absolutePath)
                         _downloadProgress.value = 1f
                         return@withContext Result.success(modelFile)
@@ -145,8 +186,10 @@ class ModelManager @Inject constructor(
                     lastError = e
                 }
             }
-            _status.value = ModelStatus.Error(lastError?.message ?: "All candidate files failed")
-            Result.failure(lastError ?: Exception("Download failed"))
+
+            val msg = lastError?.message ?: "すべての候補ファイルのダウンロードに失敗"
+            _status.value = ModelStatus.Error(msg)
+            Result.failure(lastError ?: Exception(msg))
         } finally {
             downloading.set(false)
         }
@@ -154,7 +197,9 @@ class ModelManager @Inject constructor(
 
     fun deleteModel() {
         modelFile.delete()
-        File(modelsDir, "plamo-3-translate-0.8b-Q4_K_M.gguf.tmp").delete()
+        modelsDir.listFiles()?.forEach { f ->
+            if (f.name.endsWith(".tmp") || f.name.endsWith(".gguf")) f.delete()
+        }
         refreshStatus()
     }
 
@@ -178,6 +223,7 @@ class ModelManager @Inject constructor(
 sealed class ModelStatus {
     data object NotDownloaded : ModelStatus()
     data object Downloading : ModelStatus()
+    data object Loading : ModelStatus()
     data class Ready(val path: String) : ModelStatus()
     data object Corrupted : ModelStatus()
     data class Error(val message: String) : ModelStatus()

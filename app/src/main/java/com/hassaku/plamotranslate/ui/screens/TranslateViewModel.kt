@@ -25,6 +25,7 @@ data class TranslateUiState(
     val style: Style = Style.PLAIN,
     val isTranslating: Boolean = false,
     val isModelReady: Boolean = false,
+    val isLoadingModel: Boolean = false,
     val engineName: String = "Mock",
     val error: String? = null,
     val downloadProgress: Float = 0f,
@@ -120,7 +121,8 @@ class TranslateViewModel @Inject constructor(
                 },
                 onFailure = { e ->
                     val msg = when {
-                        e.message?.contains("already in progress") == true ->
+                        e.message?.contains("already in progress") == true ||
+                            e.message?.contains("処理中") == true ->
                             "翻訳処理中です。完了までお待ちください"
                         else -> e.message ?: "翻訳に失敗しました"
                     }
@@ -139,7 +141,14 @@ class TranslateViewModel @Inject constructor(
     fun downloadModel() {
         viewModelScope.launch {
             autoLoadStarted.set(false)
-            modelManager.downloadModel()
+            _uiState.update { it.copy(error = null) }
+            val result = modelManager.downloadModel()
+            result.onFailure { e ->
+                _uiState.update {
+                    it.copy(error = e.message ?: "ダウンロードに失敗しました")
+                }
+            }
+            // Ready status triggers auto-load via status collector
         }
     }
 
@@ -149,18 +158,30 @@ class TranslateViewModel @Inject constructor(
                 ?: (modelManager.status.value as? ModelStatus.Ready)?.path
                 ?: modelManager.modelFile.absolutePath
 
-            _uiState.update { it.copy(error = null) }
+            _uiState.update {
+                it.copy(
+                    error = null,
+                    isLoadingModel = true,
+                    modelStatus = ModelStatus.Loading
+                )
+            }
             val result = realEngine.loadModel(targetPath)
             result.fold(
                 onSuccess = {
                     activeEngine = realEngine
+                    modelManager.refreshStatus()
+                    _uiState.update { it.copy(isLoadingModel = false) }
                     refreshEngineStatus()
                 },
                 onFailure = { e ->
                     activeEngine = mockEngine
                     autoLoadStarted.set(false)
+                    modelManager.refreshStatus()
                     _uiState.update {
-                        it.copy(error = "モデルの読み込みに失敗しました")
+                        it.copy(
+                            isLoadingModel = false,
+                            error = e.message ?: "モデルの読み込みに失敗しました"
+                        )
                     }
                     refreshEngineStatus()
                 }

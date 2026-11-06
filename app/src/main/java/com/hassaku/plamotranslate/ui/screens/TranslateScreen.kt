@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -11,11 +12,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.hassaku.plamotranslate.data.inference.Style
 import com.hassaku.plamotranslate.data.model.ModelStatus
@@ -53,9 +53,14 @@ fun TranslateScreen(
                 status = state.modelStatus,
                 progress = state.downloadProgress,
                 isReady = state.isModelReady,
+                isLoadingModel = state.isLoadingModel,
                 onDownload = { viewModel.downloadModel() },
                 onLoad = { viewModel.loadModel() }
             )
+
+            state.error?.let { err ->
+                Text(err, color = MaterialTheme.colorScheme.error)
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -99,7 +104,7 @@ fun TranslateScreen(
             Button(
                 onClick = { viewModel.translate() },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !state.isTranslating && state.input.isNotBlank()
+                enabled = !state.isTranslating && state.input.isNotBlank() && !state.isLoadingModel
             ) {
                 if (state.isTranslating) {
                     CircularProgressIndicator(
@@ -114,22 +119,22 @@ fun TranslateScreen(
                 }
             }
 
-            if (state.output.isNotEmpty() || state.error != null) {
+            if (state.output.isNotEmpty()) {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp)) {
                         Text("訳文", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(8.dp))
-                        if (state.error != null) {
-                            Text(state.error!!, color = MaterialTheme.colorScheme.error)
-                        } else {
-                            Text(state.output)
-                            Spacer(Modifier.height(8.dp))
-                            val clipboard = LocalClipboardManager.current
-                            TextButton(onClick = { clipboard.setText(AnnotatedString(state.output)) }) {
-                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("コピー")
-                            }
+                        Text(state.output)
+                        Spacer(Modifier.height(8.dp))
+                        val clipboard = LocalClipboardManager.current
+                        TextButton(onClick = { clipboard.setText(AnnotatedString(state.output)) }) {
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text("コピー")
                         }
                     }
                 }
@@ -143,25 +148,31 @@ private fun ModelStatusCard(
     status: ModelStatus,
     progress: Float,
     isReady: Boolean,
+    isLoadingModel: Boolean,
     onDownload: () -> Unit,
     onLoad: () -> Unit
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("モデル状態", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-            when (status) {
-                is ModelStatus.NotDownloaded -> {
-                    Text("PLaMo 3 0.8B (Q4_K_M) 未ダウンロード")
+            when {
+                isLoadingModel || status is ModelStatus.Loading -> {
+                    Text("モデルをメモリに読み込み中…（数十秒かかることがあります）")
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                status is ModelStatus.NotDownloaded -> {
+                    Text("PLaMo 3 0.8B 未ダウンロード")
+                    Text("Wi‑Fi推奨・空き容量800MB以上")
                     Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
-                        Text("モデルをダウンロード (~0.6-0.8GB)")
+                        Text("モデルをダウンロード (~0.5–0.6GB)")
                     }
                 }
-                is ModelStatus.Downloading -> {
+                status is ModelStatus.Downloading -> {
                     Text("ダウンロード中... ${(progress * 100).toInt()}%")
                     LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                 }
-                is ModelStatus.Ready -> {
-                    Text("モデル準備完了")
+                status is ModelStatus.Ready -> {
+                    Text("ファイル準備完了")
                     if (!isReady) {
                         Button(onClick = onLoad, modifier = Modifier.fillMaxWidth()) {
                             Text("本推論エンジンをロード")
@@ -170,11 +181,11 @@ private fun ModelStatusCard(
                         Text("✓ 本推論準備OK", color = MaterialTheme.colorScheme.primary)
                     }
                 }
-                is ModelStatus.Corrupted -> {
-                    Text("モデルファイルが破損しています")
+                status is ModelStatus.Corrupted -> {
+                    Text("モデルファイルが破損しています。再ダウンロードしてください。")
                     Button(onClick = onDownload) { Text("再ダウンロード") }
                 }
-                is ModelStatus.Error -> {
+                status is ModelStatus.Error -> {
                     Text("エラー: ${status.message}", color = MaterialTheme.colorScheme.error)
                     Button(onClick = onDownload) { Text("再試行") }
                 }
