@@ -8,7 +8,7 @@ plugins {
 
 android {
     namespace = "com.hassaku.plamotranslate"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.hassaku.plamotranslate"

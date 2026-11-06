@@ -21,26 +21,23 @@ jobs:
           java-version: "17"
           distribution: temurin
 
-      - name: Install Android platform 35
+      - name: Install Android platform 36
         run: |
           set -e
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME" || true
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n1 || true)"
           if [ -z "$SDKMANAGER" ]; then
             SDKMANAGER="$ANDROID_HOME/tools/bin/sdkmanager"
           fi
-          echo "Using sdkmanager=$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" || \
-            "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;35.0.0" || \
+            "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" || true
 
       - name: Ensure Gradle Wrapper jar
         run: |
           mkdir -p gradle/wrapper
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
             curl -fsSL -o gradle/wrapper/gradle-wrapper.jar \
-              "https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar"
+              "https://raw.githubusercontent.com/gradle/gradle/v8.11.1/gradle/wrapper/gradle-wrapper.jar"
           fi
           chmod +x gradlew
 
