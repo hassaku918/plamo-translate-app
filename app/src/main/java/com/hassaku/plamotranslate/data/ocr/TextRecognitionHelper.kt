@@ -7,6 +7,7 @@ import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.suspendCancellableCoroutine
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -26,19 +27,39 @@ data class RecognitionResult(
 )
 
 /**
- * Offline OCR via ML Kit Japanese text recognition.
- * Latin/English mixed text is also handled reasonably by the Japanese model.
+ * Offline OCR: Japanese + Latin (alphabet).
+ * Runs both models and returns the stronger result (longer non-blank text).
  */
 @Singleton
 class TextRecognitionHelper @Inject constructor() {
 
-    private val recognizer: TextRecognizer = TextRecognition.getClient(
+    private val japaneseRecognizer: TextRecognizer = TextRecognition.getClient(
         JapaneseTextRecognizerOptions.Builder().build()
+    )
+
+    private val latinRecognizer: TextRecognizer = TextRecognition.getClient(
+        TextRecognizerOptions.DEFAULT_OPTIONS
     )
 
     suspend fun recognize(bitmap: Bitmap): RecognitionResult {
         val image = InputImage.fromBitmap(bitmap, 0)
-        return process(recognizer, image)
+        val japanese = runCatching { process(japaneseRecognizer, image) }.getOrNull()
+        val latin = runCatching { process(latinRecognizer, image) }.getOrNull()
+
+        val jaScore = score(japanese)
+        val laScore = score(latin)
+
+        return when {
+            japanese != null && jaScore >= laScore && jaScore > 0 -> japanese
+            latin != null && laScore > 0 -> latin
+            japanese != null -> japanese
+            else -> RecognitionResult(fullText = "", blocks = emptyList())
+        }
+    }
+
+    private fun score(result: RecognitionResult?): Int {
+        if (result == null) return 0
+        return result.fullText.trim().length
     }
 
     private suspend fun process(
@@ -67,6 +88,7 @@ class TextRecognitionHelper @Inject constructor() {
     }
 
     fun close() {
-        recognizer.close()
+        japaneseRecognizer.close()
+        latinRecognizer.close()
     }
 }
