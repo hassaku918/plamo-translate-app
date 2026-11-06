@@ -1,13 +1,14 @@
 package com.hassaku.plamotranslate.data.inference
 
 import android.content.Context
-import android.net.Uri
 import android.util.Log
+import androidx.core.content.FileProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -28,17 +29,19 @@ class PlamoLlamaEngine @Inject constructor(
 
     companion object {
         private const val TAG = "PlamoLlamaEngine"
-        // 4096 is heavy on mid-range phones; 2048 is enough for short translation
         private const val DEFAULT_CTX = 2048
-        private const val GEN_TIMEOUT_MS = 120_000L
-        private const val LOAD_TIMEOUT_MS = 240_000L
+        private const val GEN_TIMEOUT_MS = 180_000L
+        private const val LOAD_TIMEOUT_MS = 300_000L
         const val MAX_INPUT_CHARS = 4000
         private const val MIN_MODEL_BYTES = 300_000_000L
     }
 
     private val mutex = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val eventFlow = MutableSharedFlow<LlamaHelper.LLMEvent>(extraBufferCapacity = 128)
+    private val eventFlow = MutableSharedFlow<LlamaHelper.LLMEvent>(
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
 
     private var helper: LlamaHelper? = null
     @Volatile private var modelLoaded = false
@@ -65,18 +68,54 @@ class PlamoLlamaEngine @Inject constructor(
                 val file = File(modelPath)
                 if (!file.exists()) {
                     return@withContext Result.failure(
-                        IllegalArgumentException("モデルファイルがありません: $modelPath")
+                        IllegalArgumentException("モデルファイルがありません")
                     )
                 }
                 if (file.length() < MIN_MODEL_BYTES) {
                     return@withContext Result.failure(
                         IllegalArgumentException(
-                            "モデルが小さすぎます (${file.length() / 1_000_000}MB)。再ダウンロードしてください"
+                            "モデルが小さすぎます (${file.length() / 1_000_000}MB)。再DLしてください"
                         )
                     )
                 }
 
-                Log.i(TAG, "Loading ${file.length() / 1_000_000} MB from ${file.absolutePath}")
+                // LlamaHelper opens the model ONLY via ContentResolver.openFileDescriptor.
+                // file:// URIs fail on modern Android — must use FileProvider content://
+                val contentUri = try {
+                    FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        file
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "FileProvider failed for ${file.absolutePath}", e)
+                    return@withContext Result.failure(
+                        IllegalStateException("モデルURIの生成に失敗: ${e.message}")
+                    )
+                }
+
+                // Verify ContentResolver can actually open it before native load
+                try {
+                    context.contentResolver.openFileDescriptor(contentUri, "r").use { pfd ->
+                        if (pfd == null) {
+                            return@withContext Result.failure(
+                                IllegalStateException("モデルを開けません (openFileDescriptor=null)")
+                            )
+                        }
+                        Log.i(TAG, "FD ok, size=${pfd.statSize}")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Cannot open content URI", e)
+                    return@withContext Result.failure(
+                        IllegalStateException("モデルを開けません: ${e.message}")
+                    )
+                }
+
+                Log.i(
+                    TAG,
+                    "Loading ${file.length() / 1_000_000}MB uri=$contentUri path=${file.absolutePath}"
+                )
+
                 requestId.incrementAndGet()
                 runCatching { helper?.release() }
                 helper = null
@@ -89,9 +128,6 @@ class PlamoLlamaEngine @Inject constructor(
                 )
                 val loaded = CompletableDeferred<Unit>()
                 val myLoadGen = requestId.get()
-
-                // Prefer file:// URI for app-private storage (kotlinllamacpp docs)
-                val uri = Uri.fromFile(file).toString()
 
                 val collectJob = scope.launch {
                     eventFlow.collect { ev ->
@@ -112,7 +148,8 @@ class PlamoLlamaEngine @Inject constructor(
                 }
 
                 try {
-                    h.load(path = uri, contextLength = DEFAULT_CTX) { _ ->
+                    h.load(path = contentUri.toString(), contextLength = DEFAULT_CTX) { id ->
+                        Log.i(TAG, "load callback contextId=$id")
                         if (!loaded.isCompleted && requestId.get() == myLoadGen) {
                             loaded.complete(Unit)
                         }
@@ -133,13 +170,20 @@ class PlamoLlamaEngine @Inject constructor(
             runCatching { helper?.release() }
             helper = null
             modelLoaded = false
+            val root = generateSequence(e) { it.cause }.mapNotNull { it.message }.joinToString(" | ")
             val msg = when {
                 e.message?.contains("OutOfMemory", ignoreCase = true) == true ||
                     e is OutOfMemoryError ->
-                    "メモリ不足でロードできません。他のアプリを閉じて再試行してください"
-                e.message?.contains("timeout", ignoreCase = true) == true ->
-                    "ロードがタイムアウトしました。端末性能不足の可能性があります"
-                else -> e.message ?: "モデルの読み込みに失敗しました"
+                    "メモリ不足でロードできません。他アプリを閉じて再試行"
+                e.message?.contains("timeout", ignoreCase = true) == true ||
+                    e.message?.contains("Timed out", ignoreCase = true) == true ->
+                    "ロードがタイムアウトしました（端末が重い／メモリ不足の可能性）"
+                e.message?.contains("Cannot open", ignoreCase = true) == true ||
+                    e.message?.contains("Failed to open", ignoreCase = true) == true ->
+                    "モデルファイルを開けませんでした。再ダウンロードを試してください"
+                e.message?.contains("initialization failed", ignoreCase = true) == true ->
+                    "ネイティブ初期化に失敗。別の量子化モデルを試すか再DLしてください"
+                else -> root.ifBlank { "モデルの読み込みに失敗しました" }
             }
             Result.failure(RuntimeException(msg, e))
         } finally {
