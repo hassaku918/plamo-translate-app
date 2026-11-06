@@ -24,10 +24,8 @@ object AppModule {
     @Named("mock")
     fun provideMockEngine(engine: MockTranslationEngine): TranslationEngine = engine
 
+    /** Primary binding: real engine; ViewModel falls back to mock until model is loaded. */
     @Provides
     @Singleton
-    fun providePrimaryEngine(
-        real: PlamoLlamaEngine,
-        mock: MockTranslationEngine
-    ): TranslationEngine = mock
+    fun providePrimaryEngine(engine: PlamoLlamaEngine): TranslationEngine = engine
 }
