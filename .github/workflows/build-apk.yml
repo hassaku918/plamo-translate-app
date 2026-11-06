@@ -42,7 +42,17 @@ jobs:
           chmod +x gradlew
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace --no-daemon
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee build-log.txt
+
+      - name: Print compile errors
+        if: failure()
+        run: |
+          echo "==== e: lines ===="
+          grep -E "^e: |error:|Unresolved|What went wrong" build-log.txt || true
+          echo "==== tail ===="
+          tail -n 80 build-log.txt || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -51,3 +61,11 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
           if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-log.txt
+          retention-days: 7

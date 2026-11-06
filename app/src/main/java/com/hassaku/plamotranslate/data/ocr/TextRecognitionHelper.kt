@@ -7,7 +7,6 @@ import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.suspendCancellableCoroutine
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -26,24 +25,20 @@ data class RecognitionResult(
     val blocks: List<RecognizedBlock>
 )
 
+/**
+ * Offline OCR via ML Kit Japanese text recognition.
+ * Latin/English mixed text is also handled reasonably by the Japanese model.
+ */
 @Singleton
 class TextRecognitionHelper @Inject constructor() {
 
-    private val japaneseRecognizer: TextRecognizer = TextRecognition.getClient(
+    private val recognizer: TextRecognizer = TextRecognition.getClient(
         JapaneseTextRecognizerOptions.Builder().build()
-    )
-
-    private val latinRecognizer: TextRecognizer = TextRecognition.getClient(
-        TextRecognizerOptions.DEFAULT_OPTIONS
     )
 
     suspend fun recognize(bitmap: Bitmap): RecognitionResult {
         val image = InputImage.fromBitmap(bitmap, 0)
-        val japaneseResult = runCatching { process(japaneseRecognizer, image) }.getOrNull()
-        if (japaneseResult != null && japaneseResult.fullText.trim().length >= 2) {
-            return japaneseResult
-        }
-        return process(latinRecognizer, image)
+        return process(recognizer, image)
     }
 
     private suspend fun process(
@@ -72,7 +67,6 @@ class TextRecognitionHelper @Inject constructor() {
     }
 
     fun close() {
-        japaneseRecognizer.close()
-        latinRecognizer.close()
+        recognizer.close()
     }
 }
