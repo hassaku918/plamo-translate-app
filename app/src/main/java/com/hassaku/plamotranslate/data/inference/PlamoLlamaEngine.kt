@@ -79,8 +79,6 @@ class PlamoLlamaEngine @Inject constructor(
                     )
                 }
 
-                // LlamaHelper opens the model ONLY via ContentResolver.openFileDescriptor.
-                // file:// URIs fail on modern Android — must use FileProvider content://
                 val contentUri = try {
                     FileProvider.getUriForFile(
                         context,
@@ -94,7 +92,6 @@ class PlamoLlamaEngine @Inject constructor(
                     )
                 }
 
-                // Verify ContentResolver can actually open it before native load
                 try {
                     context.contentResolver.openFileDescriptor(contentUri, "r").use { pfd ->
                         if (pfd == null) {
@@ -170,10 +167,11 @@ class PlamoLlamaEngine @Inject constructor(
             runCatching { helper?.release() }
             helper = null
             modelLoaded = false
-            val root = generateSequence(e) { it.cause }.mapNotNull { it.message }.joinToString(" | ")
+            val root = generateSequence<Throwable>(e) { it.cause }
+                .mapNotNull { it.message }
+                .joinToString(" | ")
             val msg = when {
-                e.message?.contains("OutOfMemory", ignoreCase = true) == true ||
-                    e is OutOfMemoryError ->
+                e.message?.contains("OutOfMemory", ignoreCase = true) == true ->
                     "メモリ不足でロードできません。他アプリを閉じて再試行"
                 e.message?.contains("timeout", ignoreCase = true) == true ||
                     e.message?.contains("Timed out", ignoreCase = true) == true ->
@@ -182,7 +180,7 @@ class PlamoLlamaEngine @Inject constructor(
                     e.message?.contains("Failed to open", ignoreCase = true) == true ->
                     "モデルファイルを開けませんでした。再ダウンロードを試してください"
                 e.message?.contains("initialization failed", ignoreCase = true) == true ->
-                    "ネイティブ初期化に失敗。別の量子化モデルを試すか再DLしてください"
+                    "ネイティブ初期化に失敗。再DLしてください"
                 else -> root.ifBlank { "モデルの読み込みに失敗しました" }
             }
             Result.failure(RuntimeException(msg, e))

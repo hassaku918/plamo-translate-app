@@ -12,7 +12,8 @@
         android:label="PLaMo Translate"
         android:supportsRtl="true"
         android:theme="@style/Theme.PLaMoTranslate"
-        android:usesCleartextTraffic="false">
+        android:usesCleartextTraffic="false"
+        android:largeHeap="true">
 
         <activity
             android:name=".MainActivity"
@@ -24,7 +25,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Needed so LlamaHelper can open model via ContentResolver FD -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
