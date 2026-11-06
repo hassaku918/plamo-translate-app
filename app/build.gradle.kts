@@ -63,6 +63,13 @@ kotlin {
     }
 }
 
+// Hilt/Dagger needs kotlin-metadata-jvm that understands Kotlin 2.3 metadata
+configurations.all {
+    resolutionStrategy {
+        force("org.jetbrains.kotlin:kotlin-metadata-jvm:2.3.0")
+    }
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)
@@ -79,14 +86,14 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.5")
     implementation("androidx.compose.foundation:foundation")
 
-    implementation("com.google.dagger:hilt-android:2.56.2")
-    ksp("com.google.dagger:hilt-compiler:2.56.2")
+    implementation("com.google.dagger:hilt-android:2.60.1")
+    ksp("com.google.dagger:hilt-compiler:2.60.1")
+    ksp("org.jetbrains.kotlin:kotlin-metadata-jvm:2.3.0")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
     implementation("androidx.camera:camera-camera2:1.4.0")
     implementation("androidx.camera:camera-lifecycle:1.4.0")
     implementation("androidx.camera:camera-view:1.4.0")
-    // Japanese OCR only (avoids latin TextRecognizerOptions package ambiguity)
     implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
