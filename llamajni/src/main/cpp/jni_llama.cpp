@@ -192,22 +192,16 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
         char buf[256];
         const int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n > 0) {
-            out.append(buf, buf + n);
-        }
-
-        // Early stop: translation often ends after a paragraph
-        if (out.size() > 8) {
-            if (out.find("<|plamo") != std::string::npos) {
-                auto pos = out.find("<|plamo");
-                out.resize(pos);
+            const std::string piece(buf, buf + n);
+            // PFML3 stop tokens (model card): the translation ends when the
+            // model emits <|plamo:tag|> or <|plamo:bos|>. Stop on those
+            // tokens themselves and never append their text. Other
+            // heuristics (blank-line cuts etc.) were removed: they truncated
+            // legitimate multi-paragraph translations.
+            if (piece == "<|plamo:tag|>" || piece == "<|plamo:bos|>") {
                 break;
             }
-            // Stop if we already have a non-trivial line and hit a blank line
-            if (out.size() > 40 && out.find("\n\n") != std::string::npos) {
-                auto pos = out.find("\n\n");
-                out.resize(pos);
-                break;
-            }
+            out.append(piece);
         }
 
         llama_token tok = id;
