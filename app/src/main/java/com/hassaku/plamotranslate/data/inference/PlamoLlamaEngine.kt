@@ -134,44 +134,46 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
     }
 
     private fun buildPrompt(text: String, sourceLang: String, targetLang: String, style: Style): String {
-        val src = normalizeLang(sourceLang)
-        val tgt = normalizeLang(targetLang)
-        val styleHint = when {
-            tgt.equals("Japanese", ignoreCase = true) && style == Style.POLITE ->
-                "\nWrite the translation in polite Japanese."
-            tgt.equals("Japanese", ignoreCase = true) && style == Style.PLAIN ->
-                "\nWrite the translation in plain Japanese."
-            else -> ""
-        }
-        return buildString {
-            appendLine("<|plamo:op|>dataset")
-            appendLine("translation")
-            appendLine()
-            appendLine("<|plamo:op|>input lang=$src")
-            appendLine(text.trim())
-            append("<|plamo:op|>output lang=$tgt")
-            if (styleHint.isNotEmpty()) append(styleHint)
-            appendLine()
-        }
+        // Official PFML3 format (model card pfnet/plamo-3-translate-0.8b-GGUF).
+        // Style is passed via the PFML3 form key (plain/polite, Japanese output
+        // only — enforced inside Pfml3), not as a natural-language hint.
+        return Pfml3.buildPrompt(
+            sourceText = text.trim(),
+            sourceLang = toLangCode(sourceLang),
+            targetLang = toLangCode(targetLang),
+            form = when (style) {
+                Style.POLITE -> Pfml3.FORM_POLITE
+                Style.PLAIN -> Pfml3.FORM_PLAIN
+            },
+        )
     }
 
-    private fun normalizeLang(lang: String): String = when (lang.lowercase().trim()) {
-        "ja", "jp", "japanese", "日本語" -> "Japanese"
-        "en", "english", "英語" -> "English"
-        "zh", "chinese", "中文", "中国語" -> "Chinese"
-        "ko", "korean", "韓国語" -> "Korean"
-        else -> lang.replaceFirstChar { it.uppercase() }
+    /**
+     * Convert the UI/engine language names ("English", "Japanese", codes, ...)
+     * to the language codes PFML3 expects ("en", "ja", ...).
+     * Unknown values are passed through lower-cased as a best effort.
+     */
+    private fun toLangCode(lang: String): String = when (lang.lowercase().trim()) {
+        "ja", "jp", "japanese", "日本語" -> "ja"
+        "en", "english", "英語" -> "en"
+        "zh", "zh-hans", "chinese", "中文", "中国語" -> "zh-hans"
+        "zh-hant", "中国語（繁体字）" -> "zh-hant"
+        "ko", "korean", "韓国語" -> "ko"
+        else -> lang.lowercase().trim()
     }
 
     private fun postProcess(raw: String): String {
         var s = raw.trim()
-        s = s.replace(Regex("<\\|plamo:op\\|>.*"), "")
-            .replace(Regex("<\\|plamo:reserved:[^|]*\\|>"), "")
-            .trim()
-        // Drop trailing incomplete line noise
-        if (s.contains("\n\n")) {
-            s = s.substringBefore("\n\n").trim()
+        // The model ends a translation by emitting a PFML3 stop token
+        // (<|plamo:tag|> / <|plamo:bos|>). JNI stops there, but if any token
+        // text survived into the output, cut everything from it onward —
+        // that is markup, not translation. Do NOT truncate at blank lines:
+        // multi-paragraph translations are legitimate output.
+        val stopIdx = s.indexOf("<|plamo:")
+        if (stopIdx >= 0) {
+            s = s.substring(0, stopIdx)
         }
-        return s
+        s = s.replace(Regex("<\\|plamo:reserved:[^|]*\\|>"), "")
+        return s.trim()
     }
 }
