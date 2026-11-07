@@ -25,13 +25,17 @@ class ModelManager @Inject constructor(
     companion object {
         private const val TAG = "ModelManager"
         const val HF_REPO = "pfnet/plamo-3-translate-0.8b-GGUF"
-        // Prefer smaller quants first so mid-range phones can actually load.
-        // Official sizes (approx): Q2_K ~410MB, Q3_K_M ~486MB, Q4_0 ~548MB, Q4_K_M ~573MB
+        // Default is Q4_K_M per the official model card ("Default. start
+        // here"). Q4_0 is the only automatic fallback (smartphone-optimised
+        // kernels, accuracy close to Q4_K_M). Q3_K_M / Q2_K are NOT automatic
+        // fallbacks: on the 0.8B model their accuracy drop is clearly larger
+        // (see the card's FLORES+ figures), so silently landing on them made
+        // translations worse without the user knowing. A model file already
+        // on disk (any quant) is still used as-is via refreshStatus().
+        // Official sizes (approx): Q4_K_M ~573MB, Q4_0 ~548MB
         val CANDIDATE_FILES = listOf(
-            "plamo-3-translate-0.8b-Q2_K.gguf",
-            "plamo-3-translate-0.8b-Q3_K_M.gguf",
-            "plamo-3-translate-0.8b-Q4_0.gguf",
-            "plamo-3-translate-0.8b-Q4_K_M.gguf"
+            "plamo-3-translate-0.8b-Q4_K_M.gguf",
+            "plamo-3-translate-0.8b-Q4_0.gguf"
         )
         private const val MIN_VALID_BYTES = 200_000_000L
         private const val MIN_FREE_BYTES = 600_000_000L
