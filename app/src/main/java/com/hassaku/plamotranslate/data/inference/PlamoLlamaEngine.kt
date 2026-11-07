@@ -3,6 +3,7 @@ package com.hassaku.plamotranslate.data.inference
 import android.util.Log
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
+import dev.ffmpegkit.llama.LlamaModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -14,7 +15,7 @@ import javax.inject.Singleton
 
 /**
  * On-device PLaMo via llama-android (llama.cpp AAR).
- * Uses absolute file path (app-private storage) — no ContentResolver URI required.
+ * Uses absolute file path in app-private storage.
  */
 @Singleton
 class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
@@ -28,14 +29,14 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
     }
 
     private val mutex = Mutex()
-    private var modelHandle: Long = 0L
+    private var model: LlamaModel? = null
     @Volatile private var modelLoaded = false
     private var currentModelPath: String? = null
     private val loading = AtomicBoolean(false)
     private val translating = AtomicBoolean(false)
 
     override val isReady: Boolean
-        get() = modelLoaded && modelHandle != 0L
+        get() = modelLoaded && model != null
 
     override val engineName: String
         get() = if (isReady) "PLaMo-3-0.8B (llama-android)" else "PLaMo (not loaded)"
@@ -70,15 +71,14 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
 
                 Log.i(TAG, "Loading ${file.length() / 1_000_000}MB from ${file.absolutePath}")
 
-                // Release previous
-                if (modelHandle != 0L) {
-                    runCatching { Llama.releaseModel(modelHandle) }
-                    modelHandle = 0L
-                    modelLoaded = false
+                model?.let { old ->
+                    runCatching { Llama.releaseModel(old) }
                 }
+                model = null
+                modelLoaded = false
 
                 val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
-                val handle = try {
+                val loaded = try {
                     Llama.loadModel(
                         modelPath = file.absolutePath,
                         config = LlamaConfig(
@@ -94,31 +94,23 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
                     )
                 }
 
-                if (handle == 0L) {
-                    throw RuntimeException(
-                        "ネイティブロード失敗 (handle=0)。" +
-                            "この端末/ビルドが PLaMo 3 アーキテクチャ未対応の可能性があります"
-                    )
-                }
-
-                modelHandle = handle
+                model = loaded
                 modelLoaded = true
                 currentModelPath = modelPath
-                Log.i(TAG, "Model loaded OK handle=$handle threads=$threads")
+                Log.i(TAG, "Model loaded OK threads=$threads")
                 Result.success(Unit)
             }
         } catch (e: Exception) {
             Log.e(TAG, "loadModel failed", e)
-            modelHandle = 0L
+            model = null
             modelLoaded = false
             currentModelPath = null
             val msg = when {
                 e.message?.contains("OutOfMemory", ignoreCase = true) == true ->
                     "メモリ不足でロードできません。他アプリを閉じて再試行"
                 e.message?.contains("unsupported", ignoreCase = true) == true ||
-                    e.message?.contains("unknown model", ignoreCase = true) == true ||
-                    e.message?.contains("アーキテクチャ", ignoreCase = true) == true ->
-                    "このエンジンは PLaMo 3 を認識できません: ${e.message}"
+                    e.message?.contains("unknown model", ignoreCase = true) == true ->
+                    "このエンジンはモデル形式を認識できません: ${e.message}"
                 else -> e.message ?: "モデルの読み込みに失敗しました"
             }
             Result.failure(RuntimeException(msg, e))
@@ -128,10 +120,8 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
     }
 
     override fun unloadModel() {
-        if (modelHandle != 0L) {
-            runCatching { Llama.releaseModel(modelHandle) }
-        }
-        modelHandle = 0L
+        model?.let { runCatching { Llama.releaseModel(it) } }
+        model = null
         modelLoaded = false
         currentModelPath = null
     }
@@ -149,8 +139,8 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
             return@withContext Result.failure(IllegalStateException("翻訳処理中です"))
         }
         val clipped = if (text.length > MAX_INPUT_CHARS) text.take(MAX_INPUT_CHARS) else text
-        val handle = modelHandle
-        if (handle == 0L) {
+        val handle = model
+        if (handle == null) {
             translating.set(false)
             return@withContext Result.failure(IllegalStateException("エンジンが初期化されていません"))
         }
@@ -161,11 +151,10 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
                 val result = Llama.complete(
                     model = handle,
                     prompt = prompt,
-                    systemPrompt = null,
+                    systemPrompt = "",
                     maxTokens = MAX_GEN_TOKENS,
                 )
-                val raw = result.text
-                Result.success(postProcess(raw))
+                Result.success(postProcess(result.text))
             }
         } catch (e: Exception) {
             Log.e(TAG, "translate failed", e)
@@ -185,7 +174,6 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
                 "\nWrite the translation in plain Japanese."
             else -> ""
         }
-        // Official PLaMo 3 Translate prompt format
         return buildString {
             appendLine("<|plamo:op|>dataset")
             appendLine("translation")
