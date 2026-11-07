@@ -33,8 +33,12 @@ fun TranslateScreen(
                 title = { Text("PLaMo Translate") },
                 actions = {
                     Text(
-                        text = state.engineName,
+                        text = if (state.isModelInMemory) "RAM使用中" else state.engineName,
                         style = MaterialTheme.typography.labelSmall,
+                        color = if (state.isModelInMemory)
+                            MaterialTheme.colorScheme.error
+                        else
+                            MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(end = 12.dp)
                     )
                 }
@@ -52,10 +56,12 @@ fun TranslateScreen(
             ModelStatusCard(
                 status = state.modelStatus,
                 progress = state.downloadProgress,
-                isReady = state.isModelReady,
+                isInMemory = state.isModelInMemory,
                 isLoadingModel = state.isLoadingModel,
                 onDownload = { viewModel.downloadModel() },
-                onLoad = { viewModel.loadModel() }
+                onLoad = { viewModel.loadModel() },
+                onUnload = { viewModel.unloadModel() },
+                onDelete = { viewModel.deleteModel() }
             )
 
             state.error?.let { err ->
@@ -98,7 +104,9 @@ fun TranslateScreen(
                 label = { Text("原文") },
                 placeholder = { Text("翻訳したいテキストを入力...") },
                 maxLines = 8,
-                supportingText = { Text("${state.input.length} / 4000") }
+                supportingText = {
+                    Text("${state.input.length} / ${com.hassaku.plamotranslate.data.inference.PlamoLlamaEngine.MAX_INPUT_CHARS}")
+                }
             )
 
             Button(
@@ -106,22 +114,39 @@ fun TranslateScreen(
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !state.isTranslating && state.input.isNotBlank() && !state.isLoadingModel
             ) {
-                if (state.isTranslating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("翻訳中...")
-                } else {
-                    Text(if (state.isModelReady) "本推論で翻訳" else "翻訳 (モック)")
+                when {
+                    state.isLoadingModel -> {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("モデル読み込み中...")
+                    }
+                    state.isTranslating -> {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("翻訳中...")
+                    }
+                    else -> {
+                        val label = when {
+                            state.isModelInMemory -> "本推論で翻訳"
+                            state.modelStatus is ModelStatus.Ready -> "ロードして翻訳"
+                            else -> "翻訳 (モック)"
+                        }
+                        Text(label)
+                    }
                 }
             }
 
             if (state.output.isNotEmpty()) {
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp)) {
+                    Column(modifier = Modifier.padding(16.dp)) {
                         Text("訳文", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(8.dp))
                         Text(state.output)
@@ -147,14 +172,21 @@ fun TranslateScreen(
 private fun ModelStatusCard(
     status: ModelStatus,
     progress: Float,
-    isReady: Boolean,
+    isInMemory: Boolean,
     isLoadingModel: Boolean,
     onDownload: () -> Unit,
-    onLoad: () -> Unit
+    onLoad: () -> Unit,
+    onUnload: () -> Unit,
+    onDelete: () -> Unit
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("モデル状態", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+            Text(
+                "方針: 翻訳時だけRAMに載せ、終わったら自動で解放します",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             when {
                 isLoadingModel || status is ModelStatus.Loading -> {
                     Text("モデルをメモリに読み込み中…（数十秒かかることがあります）")
@@ -162,23 +194,28 @@ private fun ModelStatusCard(
                 }
                 status is ModelStatus.NotDownloaded -> {
                     Text("PLaMo 3 0.8B 未ダウンロード")
-                    Text("Wi‑Fi推奨・空き容量800MB以上")
+                    Text("Wi‑Fi推奨・空き容量600MB以上（小さい量子化を優先）")
                     Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
-                        Text("モデルをダウンロード (~0.5–0.6GB)")
+                        Text("モデルをダウンロード")
                     }
                 }
                 status is ModelStatus.Downloading -> {
                     Text("ダウンロード中... ${(progress * 100).toInt()}%")
                     LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                 }
-                status is ModelStatus.Ready -> {
-                    Text("ファイル準備完了")
-                    if (!isReady) {
-                        Button(onClick = onLoad, modifier = Modifier.fillMaxWidth()) {
-                            Text("本推論エンジンをロード")
+                status is ModelStatus.Ready || isInMemory -> {
+                    if (isInMemory) {
+                        Text("⚠ いまRAMに載っています（約15秒後 or バックグラウンドで解放）",
+                            color = MaterialTheme.colorScheme.error)
+                        OutlinedButton(onClick = onUnload, modifier = Modifier.fillMaxWidth()) {
+                            Text("今すぐメモリから解放")
                         }
                     } else {
-                        Text("✓ 本推論準備OK", color = MaterialTheme.colorScheme.primary)
+                        Text("ディスク上に保存済み（RAM未使用）")
+                        Text("翻訳ボタンで必要時のみロードします", style = MaterialTheme.typography.bodySmall)
+                    }
+                    TextButton(onClick = onDelete) {
+                        Text("モデルを削除")
                     }
                 }
                 status is ModelStatus.Corrupted -> {
