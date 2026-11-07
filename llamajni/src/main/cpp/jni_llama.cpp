@@ -73,8 +73,6 @@ Java_com_hassaku_llamajni_NativeLlama_nativeLoad(
     LOGi("loading model: %s ctx=%d threads=%d", path.c_str(), (int) n_ctx, (int) n_threads);
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.use_mmap = true;
-    mparams.use_mlock = false;
     mparams.n_gpu_layers = 0;
 
     g_model = llama_model_load_from_file(path.c_str(), mparams);
@@ -120,12 +118,11 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
     const std::string prompt = jstring_to_string(env, jprompt);
     const llama_vocab * vocab = llama_model_get_vocab(g_model);
 
-    // clear memory / KV
     llama_memory_clear(llama_get_memory(g_ctx), true);
 
     std::vector<llama_token> tokens;
     tokens.resize(prompt.size() + 32);
-    const int n_prompt = llama_tokenize(
+    int n_prompt = llama_tokenize(
             vocab,
             prompt.c_str(),
             (int32_t) prompt.size(),
@@ -135,7 +132,7 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
             /*parse_special*/ true);
     if (n_prompt < 0) {
         tokens.resize(-n_prompt);
-        const int n2 = llama_tokenize(
+        n_prompt = llama_tokenize(
                 vocab,
                 prompt.c_str(),
                 (int32_t) prompt.size(),
@@ -143,18 +140,15 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
                 (int32_t) tokens.size(),
                 true,
                 true);
-        if (n2 < 0) {
+        if (n_prompt < 0) {
             LOGe("tokenize failed");
             return env->NewStringUTF("");
         }
-        tokens.resize(n2);
-    } else {
-        tokens.resize(n_prompt);
     }
+    tokens.resize(n_prompt);
 
     LOGi("prompt tokens=%zu", tokens.size());
 
-    // evaluate prompt
     for (size_t i = 0; i < tokens.size(); ++i) {
         llama_batch batch = llama_batch_get_one(&tokens[i], 1);
         if (llama_decode(g_ctx, batch) != 0) {
@@ -163,7 +157,6 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
         }
     }
 
-    // greedy sampler chain
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
@@ -184,7 +177,8 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
             out.append(buf, buf + n);
         }
 
-        llama_batch batch = llama_batch_get_one((llama_token *) &id, 1);
+        llama_token tok = id;
+        llama_batch batch = llama_batch_get_one(&tok, 1);
         if (llama_decode(g_ctx, batch) != 0) {
             LOGe("decode failed during generation");
             break;
