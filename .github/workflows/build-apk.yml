@@ -8,12 +8,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
-      - name: Checkout
+      - name: Checkout app
         uses: actions/checkout@v4
+
+      - name: Clone llama.cpp (current master — includes plamo3)
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
+          echo "llama.cpp HEAD: $(git -C llama.cpp rev-parse --short HEAD)"
+          # Prove plamo3 is present in this tree before spending time on NDK build
+          grep -n "PLAMO3\|plamo3" llama.cpp/src/llama-arch.cpp | head -n 5
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -21,7 +30,7 @@ jobs:
           java-version: "17"
           distribution: temurin
 
-      - name: Install Android platform 36
+      - name: Install NDK / CMake / platform
         run: |
           set -e
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n1 || true)"
@@ -29,8 +38,11 @@ jobs:
             SDKMANAGER="$ANDROID_HOME/tools/bin/sdkmanager"
           fi
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platforms;android-36" "build-tools;35.0.0" || \
-            "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" || true
+          "$SDKMANAGER" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "cmake;3.22.1" \
+            "ndk;27.0.12077973"
 
       - name: Ensure Gradle Wrapper jar
         run: |
@@ -41,18 +53,38 @@ jobs:
           fi
           chmod +x gradlew
 
-      - name: Build Debug APK
+      - name: Build Debug APK (native llama.cpp)
         run: |
           set -o pipefail
-          ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee build-log.txt
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon 2>&1 | tee build-log.txt
+
+      - name: Verify arm64 native lib packaged
+        run: |
+          set -e
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -n1)
+          echo "APK=$APK"
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libllama|lib/arm64-v8a/libllamajni|lib/arm64-v8a/libggml' || {
+            echo "Native libs missing from APK"
+            unzip -l "$APK" | head -100
+            exit 1
+          }
+          # Confirm plamo3 symbol exists in packaged libllama if present as separate .so
+          TMP=$(mktemp -d)
+          unzip -qo "$APK" "lib/arm64-v8a/*" -d "$TMP"
+          if [ -f "$TMP/lib/arm64-v8a/libllama.so" ]; then
+            strings "$TMP/lib/arm64-v8a/libllama.so" | grep -i plamo3 | head -n 3
+          fi
+          if [ -f "$TMP/lib/arm64-v8a/libllamajni.so" ]; then
+            echo "libllamajni.so present ($(stat -c%s "$TMP/lib/arm64-v8a/libllamajni.so") bytes)"
+          fi
 
       - name: Print compile errors
         if: failure()
         run: |
-          echo "==== e: lines ===="
-          grep -E "^e: |error:|Unresolved|What went wrong" build-log.txt || true
+          echo "==== e: / error: lines ===="
+          grep -E "^e: |error:|Unresolved|What went wrong|FAILED|fatal" build-log.txt | tail -n 80 || true
           echo "==== tail ===="
-          tail -n 80 build-log.txt || true
+          tail -n 100 build-log.txt || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

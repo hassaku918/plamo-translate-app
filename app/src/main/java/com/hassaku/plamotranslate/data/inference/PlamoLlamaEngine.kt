@@ -1,12 +1,8 @@
 package com.hassaku.plamotranslate.data.inference
 
 import android.util.Log
-import dev.ffmpegkit.llama.Llama
-import dev.ffmpegkit.llama.LlamaConfig
-import dev.ffmpegkit.llama.LlamaModel
+import com.hassaku.llamajni.NativeLlama
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -14,33 +10,28 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * On-device PLaMo via llama-android (llama.cpp AAR).
- * Uses absolute file path in app-private storage.
+ * On-device PLaMo via official llama.cpp (compiled into :llamajni).
  */
 @Singleton
 class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
 
     companion object {
         private const val TAG = "PlamoLlamaEngine"
-        // Keep context modest: large ctx inflates KV memory and can tip OOM on mid-range phones.
         private const val DEFAULT_CTX = 1024
         private const val MAX_GEN_TOKENS = 512
         const val MAX_INPUT_CHARS = 2000
         private const val MIN_MODEL_BYTES = 200_000_000L
     }
 
-    private val mutex = Mutex()
-    private var model: LlamaModel? = null
-    @Volatile private var modelLoaded = false
-    private var currentModelPath: String? = null
     private val loading = AtomicBoolean(false)
     private val translating = AtomicBoolean(false)
+    private var currentModelPath: String? = null
 
     override val isReady: Boolean
-        get() = modelLoaded && model != null
+        get() = NativeLlama.isLoaded
 
     override val engineName: String
-        get() = if (isReady) "PLaMo-3-0.8B (llama-android)" else "PLaMo (not loaded)"
+        get() = if (isReady) "PLaMo-3-0.8B (llama.cpp)" else "PLaMo (not loaded)"
 
     override suspend fun loadModel(modelPath: String): Result<Unit> = withContext(Dispatchers.IO) {
         if (isReady && currentModelPath == modelPath) {
@@ -50,108 +41,69 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
             return@withContext Result.failure(IllegalStateException("ロード処理中です"))
         }
         try {
-            mutex.withLock {
-                val file = File(modelPath)
-                if (!file.exists()) {
-                    return@withContext Result.failure(
-                        IllegalArgumentException("モデルファイルがありません")
-                    )
-                }
-                val sizeMb = file.length() / 1_000_000
-                if (file.length() < MIN_MODEL_BYTES) {
-                    return@withContext Result.failure(
-                        IllegalArgumentException(
-                            "モデルが小さすぎます (${sizeMb}MB)。再DLしてください"
-                        )
-                    )
-                }
-                if (!file.canRead()) {
-                    return@withContext Result.failure(
-                        IllegalArgumentException("モデルを読めません: ${file.absolutePath}")
-                    )
-                }
-                // Quick GGUF magic check
-                val magicOk = try {
-                    file.inputStream().use { ins ->
-                        val m = ByteArray(4)
-                        ins.read(m) == 4 && m.contentEquals(byteArrayOf(0x47, 0x47, 0x55, 0x46))
-                    }
-                } catch (_: Exception) { false }
-                if (!magicOk) {
-                    return@withContext Result.failure(
-                        IllegalArgumentException("GGUF形式ではありません。モデルを削除して再DLしてください")
-                    )
-                }
-
-                val rt = Runtime.getRuntime()
-                System.gc()
-                val maxMb = rt.maxMemory() / 1_000_000
-                val freeMb = (rt.maxMemory() - rt.totalMemory() + rt.freeMemory()) / 1_000_000
-                Log.i(
-                    TAG,
-                    "Loading ${sizeMb}MB from ${file.absolutePath} " +
-                        "jvmMax=${maxMb}MB jvmFree≈${freeMb}MB"
-                )
-
-                model?.let { old ->
-                    runCatching { Llama.releaseModel(old) }
-                }
-                model = null
-                modelLoaded = false
-
-                // Heuristic: model + ~30% overhead should fit in JVM max (rough; native is off-heap)
-                if (maxMb > 0 && sizeMb > maxMb) {
-                    Log.w(TAG, "Model ${sizeMb}MB may exceed JVM max ${maxMb}MB")
-                }
-
-                val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
-                val loaded = try {
-                    Llama.loadModel(
-                        modelPath = file.absolutePath,
-                        config = LlamaConfig(
-                            contextSize = DEFAULT_CTX,
-                            threads = threads,
-                            gpuLayers = 0, // CPU only — free tier has no Vulkan
-                        ),
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Llama.loadModel threw", e)
-                    val detail = e.message ?: e.javaClass.simpleName
-                    val hint = when {
-                        detail.contains("enough RAM", ignoreCase = true) ||
-                            detail.contains("OutOfMemory", ignoreCase = true) ||
-                            detail.contains("Failed to load model", ignoreCase = true) ->
-                            "\n\n対処: 他アプリをすべて終了 → 再試行。" +
-                                "まだダメならモデル削除して小さい量子化(Q2/Q3)を再DL。" +
-                                "(現在 ${sizeMb}MB / JVM上限≈${maxMb}MB)"
-                        else -> ""
-                    }
-                    throw RuntimeException("ネイティブロード失敗: $detail$hint", e)
-                }
-
-                model = loaded
-                modelLoaded = true
-                currentModelPath = modelPath
-                Log.i(TAG, "Model loaded OK threads=$threads ctx=$DEFAULT_CTX")
-                Result.success(Unit)
+            val file = File(modelPath)
+            if (!file.exists()) {
+                return@withContext Result.failure(IllegalArgumentException("モデルファイルがありません"))
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "loadModel failed", e)
-            model = null
-            modelLoaded = false
-            currentModelPath = null
-            Result.failure(
-                RuntimeException(e.message ?: "モデルの読み込みに失敗しました", e)
+            if (file.length() < MIN_MODEL_BYTES) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("モデルが小さすぎます (${file.length() / 1_000_000}MB)")
+                )
+            }
+            val magicOk = try {
+                file.inputStream().use { ins ->
+                    val m = ByteArray(4)
+                    ins.read(m) == 4 && m.contentEquals(byteArrayOf(0x47, 0x47, 0x55, 0x46))
+                }
+            } catch (_: Exception) { false }
+            if (!magicOk) {
+                return@withContext Result.failure(
+                    IllegalArgumentException("GGUF形式ではありません。再DLしてください")
+                )
+            }
+
+            Log.i(TAG, "Loading ${file.length() / 1_000_000}MB ${file.absolutePath}")
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            val result = NativeLlama.load(
+                path = file.absolutePath,
+                nCtx = DEFAULT_CTX,
+                nThreads = threads,
             )
+            if (result.isSuccess) {
+                currentModelPath = modelPath
+                Log.i(TAG, "load ok")
+            } else {
+                currentModelPath = null
+                Log.e(TAG, "load failed: ${result.exceptionOrNull()?.message}")
+            }
+            result
+        } catch (e: Exception) {
+            currentModelPath = null
+            Log.e(TAG, "load threw", e)
+            Result.failure(e)
         } finally {
             loading.set(false)
         }
     }
 
     override fun unloadModel() {
-        model?.let { runCatching { Llama.releaseModel(it) } }
-        model = null
-        modelLoaded = false
+        // fire-and-forget bridge; ViewModel also calls suspend unload
+        try {
+            // native unload is synchronized inside JNI
+            // Use runBlocking-free path: NativeLlama.unload is suspend — call via thread
+            java.util.concurrent.Executors.newSingleThreadExecutor().execute {
+                try {
+                    kotlinx.coroutines.runBlocking { NativeLlama.unload() }
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+        currentModelPath = null
+    }
+
+    suspend fun unloadModelSuspending() {
+        NativeLlama.unload()
         currentModelPath = null
     }
 
@@ -167,24 +119,11 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
         if (!translating.compareAndSet(false, true)) {
             return@withContext Result.failure(IllegalStateException("翻訳処理中です"))
         }
-        val clipped = if (text.length > MAX_INPUT_CHARS) text.take(MAX_INPUT_CHARS) else text
-        val handle = model
-        if (handle == null) {
-            translating.set(false)
-            return@withContext Result.failure(IllegalStateException("エンジンが初期化されていません"))
-        }
         try {
-            mutex.withLock {
-                val prompt = buildPrompt(clipped, sourceLang, targetLang, style)
-                Log.d(TAG, "prompt chars=${prompt.length}")
-                val result = Llama.complete(
-                    model = handle,
-                    prompt = prompt,
-                    systemPrompt = "",
-                    maxTokens = MAX_GEN_TOKENS,
-                )
-                Result.success(postProcess(result.text))
-            }
+            val clipped = if (text.length > MAX_INPUT_CHARS) text.take(MAX_INPUT_CHARS) else text
+            val prompt = buildPrompt(clipped, sourceLang, targetLang, style)
+            val result = NativeLlama.complete(prompt, MAX_GEN_TOKENS)
+            result.map { postProcess(it) }
         } catch (e: Exception) {
             Log.e(TAG, "translate failed", e)
             Result.failure(e)
