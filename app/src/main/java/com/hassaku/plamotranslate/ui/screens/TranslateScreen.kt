@@ -64,6 +64,11 @@ fun TranslateScreen(
                 onDelete = { viewModel.deleteModel() }
             )
 
+            state.statusText?.let { msg ->
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                Text(msg, style = MaterialTheme.typography.bodyMedium)
+            }
+
             state.error?.let { err ->
                 Text(err, color = MaterialTheme.colorScheme.error)
             }
@@ -102,7 +107,7 @@ fun TranslateScreen(
                     .fillMaxWidth()
                     .heightIn(min = 120.dp),
                 label = { Text("原文") },
-                placeholder = { Text("翻訳したいテキストを入力...") },
+                placeholder = { Text("短文の方が速いです") },
                 maxLines = 8,
                 supportingText = {
                     Text("${state.input.length} / ${com.hassaku.plamotranslate.data.inference.PlamoLlamaEngine.MAX_INPUT_CHARS}")
@@ -131,7 +136,7 @@ fun TranslateScreen(
                             color = MaterialTheme.colorScheme.onPrimary
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text("翻訳中...")
+                        Text("推論中...")
                     }
                     else -> {
                         val label = when {
@@ -183,18 +188,17 @@ private fun ModelStatusCard(
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("モデル状態", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
             Text(
-                "方針: 翻訳時だけRAMに載せ、終わったら自動で解放します",
+                "アプリ使用中はモデルを保持（2分無操作で解放）。バックグラウンドで即解放。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             when {
                 isLoadingModel || status is ModelStatus.Loading -> {
-                    Text("モデルをメモリに読み込み中…（数十秒かかることがあります）")
+                    Text("モデルをメモリに読み込み中…")
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
                 status is ModelStatus.NotDownloaded -> {
                     Text("PLaMo 3 0.8B 未ダウンロード")
-                    Text("Wi‑Fi推奨・空き容量600MB以上（小さい量子化を優先）")
                     Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
                         Text("モデルをダウンロード")
                     }
@@ -205,21 +209,23 @@ private fun ModelStatusCard(
                 }
                 status is ModelStatus.Ready || isInMemory -> {
                     if (isInMemory) {
-                        Text("⚠ いまRAMに載っています（約15秒後 or バックグラウンドで解放）",
-                            color = MaterialTheme.colorScheme.error)
+                        Text("RAMに載っています（2回目以降は速い）",
+                            color = MaterialTheme.colorScheme.primary)
                         OutlinedButton(onClick = onUnload, modifier = Modifier.fillMaxWidth()) {
                             Text("今すぐメモリから解放")
                         }
                     } else {
                         Text("ディスク上に保存済み（RAM未使用）")
-                        Text("翻訳ボタンで必要時のみロードします", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = onLoad, modifier = Modifier.fillMaxWidth()) {
+                            Text("先にロードしておく")
+                        }
                     }
                     TextButton(onClick = onDelete) {
                         Text("モデルを削除")
                     }
                 }
                 status is ModelStatus.Corrupted -> {
-                    Text("モデルファイルが破損しています。再ダウンロードしてください。")
+                    Text("モデルファイルが破損しています。")
                     Button(onClick = onDownload) { Text("再ダウンロード") }
                 }
                 status is ModelStatus.Error -> {

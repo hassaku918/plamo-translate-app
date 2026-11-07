@@ -18,8 +18,9 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
     companion object {
         private const val TAG = "PlamoLlamaEngine"
         private const val DEFAULT_CTX = 1024
-        private const val MAX_GEN_TOKENS = 512
-        const val MAX_INPUT_CHARS = 2000
+        /** Translation outputs are short; keep generation tight for latency. */
+        private const val MAX_GEN_TOKENS = 128
+        const val MAX_INPUT_CHARS = 1200
         private const val MIN_MODEL_BYTES = 200_000_000L
     }
 
@@ -63,7 +64,8 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
             }
 
             Log.i(TAG, "Loading ${file.length() / 1_000_000}MB ${file.absolutePath}")
-            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            // Pixel-class phones: use more CPU for prompt eval
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(4, 6)
             val result = NativeLlama.load(
                 path = file.absolutePath,
                 nCtx = DEFAULT_CTX,
@@ -71,7 +73,7 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
             )
             if (result.isSuccess) {
                 currentModelPath = modelPath
-                Log.i(TAG, "load ok")
+                Log.i(TAG, "load ok threads=$threads")
             } else {
                 currentModelPath = null
                 Log.e(TAG, "load failed: ${result.exceptionOrNull()?.message}")
@@ -87,10 +89,7 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
     }
 
     override fun unloadModel() {
-        // fire-and-forget bridge; ViewModel also calls suspend unload
         try {
-            // native unload is synchronized inside JNI
-            // Use runBlocking-free path: NativeLlama.unload is suspend — call via thread
             java.util.concurrent.Executors.newSingleThreadExecutor().execute {
                 try {
                     kotlinx.coroutines.runBlocking { NativeLlama.unload() }
@@ -122,7 +121,9 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
         try {
             val clipped = if (text.length > MAX_INPUT_CHARS) text.take(MAX_INPUT_CHARS) else text
             val prompt = buildPrompt(clipped, sourceLang, targetLang, style)
+            val t0 = System.currentTimeMillis()
             val result = NativeLlama.complete(prompt, MAX_GEN_TOKENS)
+            Log.i(TAG, "complete took ${System.currentTimeMillis() - t0}ms")
             result.map { postProcess(it) }
         } catch (e: Exception) {
             Log.e(TAG, "translate failed", e)
@@ -167,6 +168,10 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
         s = s.replace(Regex("<\\|plamo:op\\|>.*"), "")
             .replace(Regex("<\\|plamo:reserved:[^|]*\\|>"), "")
             .trim()
+        // Drop trailing incomplete line noise
+        if (s.contains("\n\n")) {
+            s = s.substringBefore("\n\n").trim()
+        }
         return s
     }
 }

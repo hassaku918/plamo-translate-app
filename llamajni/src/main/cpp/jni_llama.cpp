@@ -43,6 +43,25 @@ std::string jstring_to_string(JNIEnv * env, jstring value) {
     return out;
 }
 
+// Decode many prompt tokens in batches (much faster than 1-token loop).
+bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, int n_batch) {
+    const int n = (int) tokens.size();
+    if (n == 0) return true;
+    n_batch = std::max(1, n_batch);
+
+    for (int i = 0; i < n; i += n_batch) {
+        const int n_eval = std::min(n_batch, n - i);
+        llama_batch batch = llama_batch_get_one(
+                const_cast<llama_token *>(tokens.data() + i),
+                n_eval);
+        if (llama_decode(ctx, batch) != 0) {
+            LOGe("decode failed at prompt offset %d (n_eval=%d)", i, n_eval);
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 extern "C" {
@@ -83,6 +102,7 @@ Java_com_hassaku_llamajni_NativeLlama_nativeLoad(
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = std::max(256, (int) n_ctx);
+    // Larger batch = faster prompt eval on CPU
     cparams.n_batch = 512;
     cparams.n_ubatch = 512;
     cparams.n_threads = std::max(1, (int) n_threads);
@@ -147,14 +167,11 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
     }
     tokens.resize(n_prompt);
 
-    LOGi("prompt tokens=%zu", tokens.size());
+    LOGi("prompt tokens=%zu (batched decode)", tokens.size());
 
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        llama_batch batch = llama_batch_get_one(&tokens[i], 1);
-        if (llama_decode(g_ctx, batch) != 0) {
-            LOGe("decode failed at prompt token %zu", i);
-            return env->NewStringUTF("");
-        }
+    const int n_batch = (int) llama_n_batch(g_ctx);
+    if (!decode_tokens(g_ctx, tokens, n_batch > 0 ? n_batch : 512)) {
+        return env->NewStringUTF("");
     }
 
     auto sparams = llama_sampler_chain_default_params();
@@ -162,8 +179,9 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
     std::string out;
-    out.reserve(1024);
-    const int max_new = std::max(1, (int) max_tokens);
+    out.reserve(512);
+    // Translation answers are short — cap hard so UI does not spin forever
+    const int max_new = std::min(std::max(16, (int) max_tokens), 192);
 
     for (int i = 0; i < max_new; ++i) {
         const llama_token id = llama_sampler_sample(smpl, g_ctx, -1);
@@ -175,6 +193,21 @@ Java_com_hassaku_llamajni_NativeLlama_nativeComplete(
         const int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n > 0) {
             out.append(buf, buf + n);
+        }
+
+        // Early stop: translation often ends after a paragraph
+        if (out.size() > 8) {
+            if (out.find("<|plamo") != std::string::npos) {
+                auto pos = out.find("<|plamo");
+                out.resize(pos);
+                break;
+            }
+            // Stop if we already have a non-trivial line and hit a blank line
+            if (out.size() > 40 && out.find("\n\n") != std::string::npos) {
+                auto pos = out.find("\n\n");
+                out.resize(pos);
+                break;
+            }
         }
 
         llama_token tok = id;

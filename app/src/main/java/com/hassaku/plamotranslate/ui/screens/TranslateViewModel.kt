@@ -31,8 +31,9 @@ data class TranslateUiState(
     val error: String? = null,
     val downloadProgress: Float = 0f,
     val modelStatus: ModelStatus = ModelStatus.NotDownloaded,
-    /** True while model weights are resident in RAM. */
-    val isModelInMemory: Boolean = false
+    val isModelInMemory: Boolean = false,
+    /** User-facing status while waiting (load / infer). */
+    val statusText: String? = null
 )
 
 @HiltViewModel
@@ -49,15 +50,14 @@ class TranslateViewModel @Inject constructor(
     private var idleUnloadJob: Job? = null
 
     companion object {
-        /** Free native memory this many ms after last successful real translate. */
-        private const val IDLE_UNLOAD_MS = 15_000L
+        // Keep warm while actively using the app — reloading is the slow part.
+        private const val IDLE_UNLOAD_MS = 120_000L
     }
 
     init {
         viewModelScope.launch {
             modelManager.status.collect { status ->
                 _uiState.update { it.copy(modelStatus = status) }
-                // Do NOT auto-load into RAM — user / translate triggers load.
             }
         }
         viewModelScope.launch {
@@ -101,14 +101,21 @@ class TranslateViewModel @Inject constructor(
 
         viewModelScope.launch {
             idleUnloadJob?.cancel()
-            _uiState.update { it.copy(isTranslating = true, error = null, output = "") }
+            _uiState.update {
+                it.copy(
+                    isTranslating = true,
+                    error = null,
+                    output = "",
+                    statusText = "準備中…"
+                )
+            }
 
-            // On-demand load: file ready but not in RAM → load just for this job.
             if (!realEngine.isReady && modelManager.isModelReady()) {
                 _uiState.update {
                     it.copy(
                         isLoadingModel = true,
-                        modelStatus = ModelStatus.Loading
+                        modelStatus = ModelStatus.Loading,
+                        statusText = "モデル読み込み中（初回のみ遅い）…"
                     )
                 }
                 val loadResult = realEngine.loadModel(modelManager.modelFile.absolutePath)
@@ -121,7 +128,8 @@ class TranslateViewModel @Inject constructor(
                             isTranslating = false,
                             error = loadResult.exceptionOrNull()?.message
                                 ?: "モデルの読み込みに失敗しました",
-                            isModelInMemory = false
+                            isModelInMemory = false,
+                            statusText = null
                         )
                     }
                     refreshEngineStatus()
@@ -131,6 +139,11 @@ class TranslateViewModel @Inject constructor(
                 modelManager.refreshStatus()
                 refreshEngineStatus()
             }
+
+            // Prefer real engine if loaded
+            if (realEngine.isReady) activeEngine = realEngine
+
+            _uiState.update { it.copy(statusText = "CPUで推論中…（短文推奨）") }
 
             val result = activeEngine.translate(
                 text = state.input,
@@ -145,13 +158,11 @@ class TranslateViewModel @Inject constructor(
                             output = out,
                             isTranslating = false,
                             engineName = activeEngine.engineName,
-                            isModelInMemory = realEngine.isReady
+                            isModelInMemory = realEngine.isReady,
+                            statusText = null
                         )
                     }
-                    // Free RAM shortly after use — do not keep weights resident.
-                    if (realEngine.isReady) {
-                        scheduleIdleUnload()
-                    }
+                    if (realEngine.isReady) scheduleIdleUnload()
                 },
                 onFailure = { e ->
                     val msg = when {
@@ -165,7 +176,8 @@ class TranslateViewModel @Inject constructor(
                             isTranslating = false,
                             error = msg,
                             engineName = activeEngine.engineName,
-                            isModelInMemory = realEngine.isReady
+                            isModelInMemory = realEngine.isReady,
+                            statusText = null
                         )
                     }
                     if (realEngine.isReady) scheduleIdleUnload()
@@ -186,7 +198,6 @@ class TranslateViewModel @Inject constructor(
         }
     }
 
-    /** Explicit load (optional). Still auto-unloads after idle. */
     fun loadModel(path: String? = null) {
         viewModelScope.launch {
             idleUnloadJob?.cancel()
@@ -198,7 +209,8 @@ class TranslateViewModel @Inject constructor(
                 it.copy(
                     error = null,
                     isLoadingModel = true,
-                    modelStatus = ModelStatus.Loading
+                    modelStatus = ModelStatus.Loading,
+                    statusText = "モデル読み込み中…"
                 )
             }
             val result = realEngine.loadModel(targetPath)
@@ -209,7 +221,8 @@ class TranslateViewModel @Inject constructor(
                     _uiState.update {
                         it.copy(
                             isLoadingModel = false,
-                            isModelInMemory = true
+                            isModelInMemory = true,
+                            statusText = null
                         )
                     }
                     refreshEngineStatus()
@@ -222,7 +235,8 @@ class TranslateViewModel @Inject constructor(
                         it.copy(
                             isLoadingModel = false,
                             error = e.message ?: "モデルの読み込みに失敗しました",
-                            isModelInMemory = false
+                            isModelInMemory = false,
+                            statusText = null
                         )
                     }
                     refreshEngineStatus()
@@ -231,7 +245,6 @@ class TranslateViewModel @Inject constructor(
         }
     }
 
-    /** Release native weights immediately (button / background). */
     fun unloadModel() {
         idleUnloadJob?.cancel()
         realEngine.unloadModel()
@@ -241,7 +254,8 @@ class TranslateViewModel @Inject constructor(
             it.copy(
                 isModelInMemory = false,
                 engineName = mockEngine.engineName,
-                isModelReady = false
+                isModelReady = false,
+                statusText = null
             )
         }
         refreshEngineStatus()
@@ -253,7 +267,6 @@ class TranslateViewModel @Inject constructor(
         _uiState.update { it.copy(error = null) }
     }
 
-    /** Called from Activity when app goes to background. */
     fun onAppBackgrounded() {
         if (realEngine.isReady) {
             unloadModel()
