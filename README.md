@@ -27,13 +27,13 @@ passed via the `form` key (`plain` / `polite`), and generation stops on
 1. Open [Actions](https://github.com/hassaku918/plamo-translate-app/actions)
 2. Workflow **Build Debug APK** → download artifact `plamo-translate-debug-apk`
 
-The workflow also runs the unit tests (`:app:testDebugUnitTest`, including
-the PFML3 prompt tests) before building.
-
 ## Local build
 The native build expects a llama.cpp checkout in the repo root
-(`<repo>/llama.cpp`). CI pins llama.cpp to commit
-`e95426f16982054c379ca7bdc8186996dd22f0fe` — use the same commit locally:
+(`<repo>/llama.cpp`). llama.cpp is pinned to commit
+`e95426f16982054c379ca7bdc8186996dd22f0fe`: `llamajni/CMakeLists.txt`
+enforces it at configure time (if the checkout's HEAD differs, it fetches
+and checks out the pinned commit and fails the build if that is
+impossible). For a local build, check it out directly:
 
 ```bash
 git init llama.cpp
