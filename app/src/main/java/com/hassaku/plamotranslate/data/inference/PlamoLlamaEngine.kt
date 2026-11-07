@@ -22,10 +22,11 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
 
     companion object {
         private const val TAG = "PlamoLlamaEngine"
-        private const val DEFAULT_CTX = 2048
-        private const val MAX_GEN_TOKENS = 1024
-        const val MAX_INPUT_CHARS = 4000
-        private const val MIN_MODEL_BYTES = 300_000_000L
+        // Keep context modest: large ctx inflates KV memory and can tip OOM on mid-range phones.
+        private const val DEFAULT_CTX = 1024
+        private const val MAX_GEN_TOKENS = 512
+        const val MAX_INPUT_CHARS = 2000
+        private const val MIN_MODEL_BYTES = 200_000_000L
     }
 
     private val mutex = Mutex()
@@ -56,10 +57,11 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
                         IllegalArgumentException("モデルファイルがありません")
                     )
                 }
+                val sizeMb = file.length() / 1_000_000
                 if (file.length() < MIN_MODEL_BYTES) {
                     return@withContext Result.failure(
                         IllegalArgumentException(
-                            "モデルが小さすぎます (${file.length() / 1_000_000}MB)。再DLしてください"
+                            "モデルが小さすぎます (${sizeMb}MB)。再DLしてください"
                         )
                     )
                 }
@@ -68,8 +70,28 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
                         IllegalArgumentException("モデルを読めません: ${file.absolutePath}")
                     )
                 }
+                // Quick GGUF magic check
+                val magicOk = try {
+                    file.inputStream().use { ins ->
+                        val m = ByteArray(4)
+                        ins.read(m) == 4 && m.contentEquals(byteArrayOf(0x47, 0x47, 0x55, 0x46))
+                    }
+                } catch (_: Exception) { false }
+                if (!magicOk) {
+                    return@withContext Result.failure(
+                        IllegalArgumentException("GGUF形式ではありません。モデルを削除して再DLしてください")
+                    )
+                }
 
-                Log.i(TAG, "Loading ${file.length() / 1_000_000}MB from ${file.absolutePath}")
+                val rt = Runtime.getRuntime()
+                System.gc()
+                val maxMb = rt.maxMemory() / 1_000_000
+                val freeMb = (rt.maxMemory() - rt.totalMemory() + rt.freeMemory()) / 1_000_000
+                Log.i(
+                    TAG,
+                    "Loading ${sizeMb}MB from ${file.absolutePath} " +
+                        "jvmMax=${maxMb}MB jvmFree≈${freeMb}MB"
+                )
 
                 model?.let { old ->
                     runCatching { Llama.releaseModel(old) }
@@ -77,27 +99,40 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
                 model = null
                 modelLoaded = false
 
-                val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+                // Heuristic: model + ~30% overhead should fit in JVM max (rough; native is off-heap)
+                if (maxMb > 0 && sizeMb > maxMb) {
+                    Log.w(TAG, "Model ${sizeMb}MB may exceed JVM max ${maxMb}MB")
+                }
+
+                val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
                 val loaded = try {
                     Llama.loadModel(
                         modelPath = file.absolutePath,
                         config = LlamaConfig(
                             contextSize = DEFAULT_CTX,
                             threads = threads,
+                            gpuLayers = 0, // CPU only — free tier has no Vulkan
                         ),
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Llama.loadModel threw", e)
-                    throw RuntimeException(
-                        "ネイティブロード失敗: ${e.message ?: e.javaClass.simpleName}",
-                        e
-                    )
+                    val detail = e.message ?: e.javaClass.simpleName
+                    val hint = when {
+                        detail.contains("enough RAM", ignoreCase = true) ||
+                            detail.contains("OutOfMemory", ignoreCase = true) ||
+                            detail.contains("Failed to load model", ignoreCase = true) ->
+                            "\n\n対処: 他アプリをすべて終了 → 再試行。" +
+                                "まだダメならモデル削除して小さい量子化(Q2/Q3)を再DL。" +
+                                "(現在 ${sizeMb}MB / JVM上限≈${maxMb}MB)"
+                        else -> ""
+                    }
+                    throw RuntimeException("ネイティブロード失敗: $detail$hint", e)
                 }
 
                 model = loaded
                 modelLoaded = true
                 currentModelPath = modelPath
-                Log.i(TAG, "Model loaded OK threads=$threads")
+                Log.i(TAG, "Model loaded OK threads=$threads ctx=$DEFAULT_CTX")
                 Result.success(Unit)
             }
         } catch (e: Exception) {
@@ -105,15 +140,9 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
             model = null
             modelLoaded = false
             currentModelPath = null
-            val msg = when {
-                e.message?.contains("OutOfMemory", ignoreCase = true) == true ->
-                    "メモリ不足でロードできません。他アプリを閉じて再試行"
-                e.message?.contains("unsupported", ignoreCase = true) == true ||
-                    e.message?.contains("unknown model", ignoreCase = true) == true ->
-                    "このエンジンはモデル形式を認識できません: ${e.message}"
-                else -> e.message ?: "モデルの読み込みに失敗しました"
-            }
-            Result.failure(RuntimeException(msg, e))
+            Result.failure(
+                RuntimeException(e.message ?: "モデルの読み込みに失敗しました", e)
+            )
         } finally {
             loading.set(false)
         }

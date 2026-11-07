@@ -25,15 +25,16 @@ class ModelManager @Inject constructor(
     companion object {
         private const val TAG = "ModelManager"
         const val HF_REPO = "pfnet/plamo-3-translate-0.8b-GGUF"
-        // Prefer smaller Q4_0 first for phones, then Q4_K_M
+        // Prefer smaller quants first so mid-range phones can actually load.
+        // Official sizes (approx): Q2_K ~410MB, Q3_K_M ~486MB, Q4_0 ~548MB, Q4_K_M ~573MB
         val CANDIDATE_FILES = listOf(
-            "plamo-3-translate-0.8b-Q4_0.gguf",      // ~522 MB
-            "plamo-3-translate-0.8b-Q4_K_M.gguf",   // ~547 MB
+            "plamo-3-translate-0.8b-Q2_K.gguf",
             "plamo-3-translate-0.8b-Q3_K_M.gguf",
-            "plamo-3-translate-0.8b-Q2_K.gguf"
+            "plamo-3-translate-0.8b-Q4_0.gguf",
+            "plamo-3-translate-0.8b-Q4_K_M.gguf"
         )
-        private const val MIN_VALID_BYTES = 300_000_000L
-        private const val MIN_FREE_BYTES = 800_000_000L
+        private const val MIN_VALID_BYTES = 200_000_000L
+        private const val MIN_FREE_BYTES = 600_000_000L
         fun resolveUrl(filename: String) =
             "https://huggingface.co/$HF_REPO/resolve/main/$filename?download=true"
     }
@@ -86,14 +87,13 @@ class ModelManager @Inject constructor(
             return@withContext Result.failure(IllegalStateException("ダウンロードは既に進行中です"))
         }
         try {
-            // Remove partial / corrupt files first
             if (modelFile.exists() && !isModelReady()) {
                 modelFile.delete()
             }
 
             val free = freeSpaceBytes(modelsDir)
             if (free in 1 until MIN_FREE_BYTES) {
-                val msg = "ストレージ不足: 空き ${(free / 1_000_000)}MB（目安 800MB以上）"
+                val msg = "ストレージ不足: 空き ${(free / 1_000_000)}MB（目安 600MB以上）"
                 _status.value = ModelStatus.Error(msg)
                 return@withContext Result.failure(IllegalStateException(msg))
             }
@@ -108,7 +108,7 @@ class ModelManager @Inject constructor(
                 try {
                     val request = Request.Builder()
                         .url(url)
-                        .header("User-Agent", "PLaMoTranslateAndroid/1.0")
+                        .header("User-Agent", "PLaMoTranslateAndroid/1.1")
                         .header("Accept", "application/octet-stream,*/*")
                         .get()
                         .build()
@@ -141,9 +141,8 @@ class ModelManager @Inject constructor(
                                         _downloadProgress.value =
                                             (downloaded.toFloat() / expected).coerceIn(0f, 1f)
                                     } else if (downloaded > 0) {
-                                        // Unknown length: approximate against ~550MB
                                         _downloadProgress.value =
-                                            (downloaded.toFloat() / 550_000_000f).coerceIn(0f, 0.99f)
+                                            (downloaded.toFloat() / 450_000_000f).coerceIn(0f, 0.99f)
                                     }
                                 }
                                 out.fd.sync()
@@ -176,7 +175,7 @@ class ModelManager @Inject constructor(
                             tmp.delete()
                         }
 
-                        Log.i(TAG, "Downloaded ${modelFile.length() / 1_000_000} MB as ${modelFile.name}")
+                        Log.i(TAG, "Downloaded ${modelFile.length() / 1_000_000} MB as ${modelFile.name} from $filename")
                         _status.value = ModelStatus.Ready(modelFile.absolutePath)
                         _downloadProgress.value = 1f
                         return@withContext Result.success(modelFile)
