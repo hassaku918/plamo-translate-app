@@ -268,6 +268,12 @@ class TranslateViewModel @Inject constructor(
     }
 
     fun onAppBackgrounded() {
+        // Never unload while a translation (or its model load) is in flight.
+        // Native generation holds the engine mutex until it finishes, so an
+        // unload queued behind it leaves the UI stuck in the translating
+        // state and then frees the model under a completed result. The idle
+        // timer scheduled on completion still unloads the model afterwards.
+        if (_uiState.value.isTranslating || realEngine.isBusy) return
         if (realEngine.isReady) {
             unloadModel()
         }

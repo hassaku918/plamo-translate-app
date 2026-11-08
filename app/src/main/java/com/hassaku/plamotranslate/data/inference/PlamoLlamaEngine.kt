@@ -31,6 +31,10 @@ class PlamoLlamaEngine @Inject constructor() : TranslationEngine {
     override val isReady: Boolean
         get() = NativeLlama.isLoaded
 
+    /** True while a model load or a translation is running on the engine. */
+    val isBusy: Boolean
+        get() = loading.get() || translating.get()
+
     override val engineName: String
         get() = if (isReady) "PLaMo-3-0.8B (llama.cpp)" else "PLaMo (not loaded)"
 
